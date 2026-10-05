@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SUiv'Eau — Suivi des cours d'eau</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root{--primary:#0284c7;--bg:#f8fafc;--surface:#fff;--text:#1e293b;--muted:#64748b;--line:#e2e8f0}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);margin:0;display:flex;flex-direction:column;height:100vh;height:100dvh}
+header{background:var(--surface);padding:12px 24px;box-shadow:0 1px 3px rgba(0,0,0,.1);display:flex;justify-content:space-between;align-items:center;gap:12px;z-index:1000}
+.logo{font-size:24px;font-weight:800;color:var(--primary)}.logo span{color:#0f172a}
+.dept{display:flex;align-items:center;gap:8px;font-size:14px}
+.dept input{width:58px;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:14px}
+.badge{background:var(--primary);color:#fff;padding:5px 12px;border-radius:20px;font-size:13px;font-weight:700}
+.container{display:flex;flex:1;min-height:0}
+#map{flex:1;z-index:1}
+.panel{width:440px;background:var(--surface);padding:18px;box-shadow:-2px 0 5px rgba(0,0,0,.05);display:flex;flex-direction:column;gap:12px;overflow-y:auto;z-index:2}
+select{padding:10px;width:100%;border-radius:6px;border:1px solid #cbd5e1;font-size:15px}
+h2{font-size:17px;margin:0}
+.sub{color:var(--muted);font-size:13px;margin-top:2px}
+.kpis{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.kpi{border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.kpi b{display:block;font-size:19px}.kpi small{color:var(--muted);font-size:12px}
+.up{color:#b91c1c}.down{color:#0369a1}
+.periods{display:flex;gap:6px}
+.periods button{flex:1;padding:6px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;font-size:14px}
+.periods button.on{background:var(--primary);color:#fff;border-color:var(--primary)}
+.chart-container{position:relative;height:290px;flex:none}
+.msg{padding:10px;border-radius:6px;background:#f1f5f9;font-size:14px}
+.msg.err{background:#fef2f2;color:#991b1b}.msg.warn{background:#fffbeb;color:#b45309}
+.note{font-size:12px;color:var(--muted);margin:auto 0 0}
+@media(max-width:800px){.container{flex-direction:column}#map{flex:none;height:42%}.panel{width:100%;flex:1}.badge{display:none}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">SUiv'<span>Eau</span></div>
+  <label class="dept">Département
+    <input id="dept" value="69" maxlength="3" aria-label="Code département">
+  </label>
+  <span class="badge">Données Hub'Eau</span>
+</header>
+
+<div class="container">
+  <div id="map"></div>
+  <aside class="panel">
+    <label for="station-select"><strong>Point de mesure</strong></label>
+    <select id="station-select"><option>Chargement…</option></select>
+    <div id="msg" class="msg" role="status" hidden></div>
+    <div>
+      <h2 id="station-title">Sélectionnez une station</h2>
+      <div id="station-sub" class="sub">Cliquez sur la carte ou utilisez la liste.</div>
+    </div>
+    <div class="kpis" id="kpis"></div>
+    <div class="periods">
+      <button data-h="6">6 h</button>
+      <button data-h="24" class="on">24 h</button>
+      <button data-h="48">48 h</button>
+    </div>
+    <div class="chart-container"><canvas id="hydroChart"></canvas></div>
+    <p class="note">Mesures brutes, non validées (source : Hub'Eau / PHyC), actualisées toutes les 5 minutes. Hauteurs relatives au zéro d'échelle de chaque station, donc parfois négatives. Outil d'aide au suivi : pour les alertes officielles, consulter vigicrues.gouv.fr.</p>
+  </aside>
+</div>
+
+<script>
+// ⚠ Remplacer par l'URL de ton service Render
+const API_BASE_URL = ["localhost", "127.0.0.1"].includes(location.hostname)
+  ? "http://localhost:8000"
+  : "https://poissonchat.onrender.com";
+const REFRESH_MS = 5 * 60 * 1000;
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const nf  = new Intl.NumberFormat("fr-FR", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const nfs = new Intl.NumberFormat("fr-FR", {minimumFractionDigits: 2, maximumFractionDigits: 2, signDisplay: "exceptZero"});
+
+const STYLE    = {radius: 7,  fillColor: "#fff",    color: "#0284c7", weight: 2, fillOpacity: 1};
+const STYLE_ON = {radius: 10, fillColor: "#0284c7", color: "#075985", weight: 3, fillOpacity: 1};
+
+const map = L.map("map").setView([45.75, 4.85], 9);
+const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, attribution: "&copy; <a href='https://www.openstreetmap.org/copyright'>OpenStreetMap</a>"
+}).addTo(map);
+const ign = L.tileLayer("https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/png", {
+  maxZoom: 19, attribution: "&copy; IGN"
+});
+L.control.layers({"OpenStreetMap": osm, "Plan IGN": ign}).addTo(map);
+const markersLayer = L.featureGroup().addTo(map);
+const markers = new Map();
+
+let stations = [], chart, current = null, hours = 24, reqId = 0, ctrl, slowTimer;
+
+// --- Messages d'état ---------------------------------------------------------
+function setMsg(text, cls = "") {
+  const m = $("msg");
+  m.textContent = text || "";
+  m.className = "msg " + cls;
+  m.hidden = !text;
+}
+function loading(text) {
+  clearTimeout(slowTimer);
+  setMsg(text);
+  // Le plan gratuit de Render s'endort : on prévient l'utilisateur
+  slowTimer = setTimeout(() => setMsg(text + " Le serveur peut mettre jusqu'à une minute à se réveiller."), 4000);
+}
+const done = () => clearTimeout(slowTimer);
+
+async function api(path, signal) {
+  const r = await fetch(API_BASE_URL + path, {signal});
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({}));
+    throw new Error(e.detail || "Erreur " + r.status);
+  }
+  return r.json();
+}
+
+// --- Stations ----------------------------------------------------------------
+async function chargerStations(dept) {
+  const sel = $("station-select");
+  sel.disabled = true;
+  sel.innerHTML = "<option>Chargement…</option>";
+  markersLayer.clearLayers();
+  markers.clear();
+  loading("Chargement des stations…");
+  try {
+    stations = await api("/api/stations?dept=" + encodeURIComponent(dept));
+    done();
+    if (!stations.length) {
+      sel.innerHTML = "<option>Aucune station</option>";
+      return setMsg("Aucune station en service pour ce département.", "warn");
+    }
+    setMsg("");
+    stations.sort((a, b) =>
+      (a.libelle_cours_eau || "").localeCompare(b.libelle_cours_eau || "", "fr") ||
+      a.libelle_station.localeCompare(b.libelle_station, "fr"));
+
+    sel.innerHTML = '<option value="">-- Choisir une station --</option>';
+    for (const s of stations) {
+      const o = document.createElement("option");
+      o.value = s.code_station;
+      o.textContent = s.libelle_station;   // le libellé contient déjà le cours d'eau
+      sel.appendChild(o);
+
+      const m = L.circleMarker([s.latitude_station, s.longitude_station], STYLE)
+        .bindTooltip(`<b>${esc(s.libelle_station)}</b><br>${esc(s.libelle_commune)}`);
+      m.on("click", () => choisir(s.code_station));
+      markersLayer.addLayer(m);
+      markers.set(s.code_station, m);
+    }
+    map.fitBounds(markersLayer.getBounds().pad(0.1));
+  } catch (e) {
+    done();
+    sel.innerHTML = "<option>Erreur</option>";
+    setMsg("Impossible de charger les stations : " + e.message, "err");
+  } finally {
+    sel.disabled = false;
+  }
+}
+
+function choisir(code) {
+  const s = stations.find(x => x.code_station === code);
+  if (!s) return;
+  if (current) markers.get(current)?.setStyle(STYLE);
+  current = code;
+  markers.get(code)?.setStyle(STYLE_ON).bringToFront();
+  $("station-select").value = code;
+  $("station-title").textContent = s.libelle_station;
+  $("station-sub").textContent = [s.libelle_commune, code].filter(Boolean).join(" · ");
+  map.panTo([s.latitude_station, s.longitude_station]);
+  chargerObservations();
+}
+
+// --- Observations ------------------------------------------------------------
+async function chargerObservations(silent = false) {
+  if (!current) return;
+  ctrl?.abort();
+  ctrl = new AbortController();
+  const id = ++reqId;
+  if (!silent) loading("Chargement des mesures…");
+  try {
+    const obs = await api(`/api/observations/${current}?size=${hours * 12}`, ctrl.signal);
+    if (id !== reqId) return;
+    done();
+    const pts = obs.filter(o => o.resultat_obs != null)
+                    .map(o => ({t: new Date(o.date_obs), h: o.resultat_obs / 1000}));
+    if (!pts.length) {
+      vider();
+      return setMsg("Aucune mesure de hauteur en temps réel pour cette station.", "warn");
+    }
+    setMsg("");
+    afficher(pts);
+  } catch (e) {
+    if (e.name === "AbortError" || id !== reqId) return;
+    done();
+    if (!silent) setMsg("Impossible de charger les mesures : " + e.message, "err");
+  }
+}
+
+function vider() {
+  $("kpis").innerHTML = "";
+  if (chart) { chart.data.labels = []; chart.data.datasets[0].data = []; chart.update(); }
+}
+
+function afficher(pts) {
+  const last = pts[pts.length - 1];
+  pts = pts.filter(p => p.t >= last.t - hours * 36e5);   // fenêtre calée sur la dernière mesure
+
+  const cible = last.t - 36e5;
+  const p1 = pts.reduce((a, b) => Math.abs(b.t - cible) < Math.abs(a.t - cible) ? b : a);
+  const delta = last.t - p1.t > 30 * 6e4 ? last.h - p1.h : null;
+  const hs = pts.map(p => p.h);
+  const age = Math.round((Date.now() - last.t) / 6e4);
+  const ageTxt = age < 60 ? `il y a ${age} min` : `il y a ${Math.round(age / 60)} h`;
+  const cls = delta === null ? "" : delta > 0.005 ? "up" : delta < -0.005 ? "down" : "";
+
+  $("kpis").innerHTML = `
+    <div class="kpi"><small>Dernière mesure</small><b>${nf.format(last.h)} m</b><small>${ageTxt}${niveau(last.h, seuils[current])}</small></div>
+    <div class="kpi"><small>Variation sur 1 h</small><b class="${cls}">${delta === null ? "—" : nfs.format(delta) + " m"}</b></div>
+    <div class="kpi"><small>Minimum (${hours} h)</small><b>${nf.format(Math.min(...hs))} m</b></div>
+    <div class="kpi"><small>Maximum (${hours} h)</small><b>${nf.format(Math.max(...hs))} m</b></div>`;
+  if (age > 90) setMsg("Dernière mesure ancienne : la station n'émet peut-être plus.", "warn");
+
+  const labels = pts.map(p => p.t.toLocaleString("fr-FR",
+    {day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"}));
+
+  if (!chart) {
+    chart = new Chart($("hydroChart"), {
+      type: "line",
+      data: {labels: [], datasets: [{
+        label: "Hauteur (m)", data: [], borderColor: "#0284c7",
+        backgroundColor: "rgba(2,132,199,.1)", borderWidth: 2, fill: true,
+        tension: 0.25, pointRadius: 0, pointHoverRadius: 4
+      }]},
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        interaction: {mode: "index", intersect: false},
+        plugins: {legend: {display: false}},
+        scales: {
+          y: {title: {display: true, text: "Hauteur (m, réf. zéro d'échelle)"}},
+          x: {ticks: {maxTicksLimit: 6, maxRotation: 0}}
+        }
+      }
+    });
+  }
+  chart.data.labels = labels;
+  chart.data.datasets[0].data = hs;
+  chart.data.datasets.length = 1;
+  const sv = seuils[current] || {};
+  for (const [nom, col] of [["jaune", "#ca8a04"], ["orange", "#ea580c"], ["rouge", "#dc2626"]]) {
+    if (sv[nom] == null) continue;
+    chart.data.datasets.push({label: "Seuil " + nom, data: hs.map(() => sv[nom]),
+      borderColor: col, borderWidth: 1.5, borderDash: [6, 4], pointRadius: 0, fill: false});
+  }
+  chart.update();
+}
+
+// --- Événements --------------------------------------------------------------
+$("station-select").onchange = e => e.target.value && choisir(e.target.value);
+
+document.querySelectorAll(".periods button").forEach(b => b.onclick = () => {
+  hours = +b.dataset.h;
+  document.querySelectorAll(".periods button").forEach(x => x.classList.toggle("on", x === b));
+  chargerObservations();
+});
+
+$("dept").onchange = e => {
+  const v = e.target.value.trim().toUpperCase();
+  if (!/^(\d{2}|2[AB]|\d{3})$/.test(v)) return setMsg("Code département invalide (ex. 69, 2A, 971).", "warn");
+  current = null; reqId++; ctrl?.abort();
+  $("station-title").textContent = "Sélectionnez une station";
+  $("station-sub").textContent = "Cliquez sur la carte ou utilisez la liste.";
+  vider();
+  chargerStations(v);
+};
+
+setInterval(() => {
+  if (current && document.visibilityState === "visible") chargerObservations(true);
+}, REFRESH_MS);
+
+// Seuils optionnels, en mètres, dans le même référentiel que le graphique :
+// {"V300002001": {"jaune": 1.5, "orange": 2.5, "rouge": 3.5}}
+let seuils = {};
+const niveau = (h, sv = {}) =>
+  h >= sv.rouge ? " · seuil rouge atteint" : h >= sv.orange ? " · seuil orange atteint" :
+  h >= sv.jaune ? " · seuil jaune atteint" : "";
+fetch("seuils.json").then(r => r.ok ? r.json() : {}).catch(() => ({}))
+  .then(j => { seuils = j; })
+  .finally(() => chargerStations($("dept").value));
+</script>
+</body>
+</html>
