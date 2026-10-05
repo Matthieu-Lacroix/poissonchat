@@ -3,10 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 import os
 
-# Si nécessaire pour votre réseau, décommentez et adaptez :
-# os.environ['HTTP_PROXY'] = "http://proxy.votre-reseau.fr:3128"
-# os.environ['HTTPS_PROXY'] = "http://proxy.votre-reseau.fr:3128"
-
 app = FastAPI(
     title="API SUiv'Eau",
     description="Backend de relais pour les données Hub'Eau",
