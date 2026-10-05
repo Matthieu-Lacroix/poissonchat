@@ -10,6 +10,7 @@ import time
 import requests
 from fastapi import FastAPI, HTTPException, Path, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -29,6 +30,8 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # --- Client HTTP -------------------------------------------------------------
 session = requests.Session()
@@ -161,4 +164,44 @@ def get_observations(
 
     data = cached(f"obs:{code_station}:{size}", ttl=300, loader=load, response=response)
     response.headers["Cache-Control"] = "public, max-age=120"
+    return data
+
+
+# --- Vigilance crues (tronçons colorés, flux Vigicrues / Etalab) -------------
+VIGICRUES_URL = "https://www.vigicrues.gouv.fr/services/1/InfoVigiCru.geojson"
+
+
+def _round(c):
+    """Arrondit les coordonnées à 4 décimales (~10 m) pour alléger le flux."""
+    if isinstance(c[0], (int, float)):
+        return [round(c[0], 4), round(c[1], 4)]
+    return [_round(x) for x in c]
+
+
+@app.get("/api/vigilance")
+def get_vigilance(response: Response):
+    """Tronçons de vigilance crues (niv : 1 vert, 2 jaune, 3 orange, 4 rouge)."""
+
+    def load():
+        try:
+            r = session.get(VIGICRUES_URL, timeout=30)
+            r.raise_for_status()
+            j = r.json()
+        except (requests.RequestException, ValueError) as e:
+            print(f"[VIGICRUES] {e!r}")
+            raise HTTPException(status_code=502, detail="Vigicrues injoignable")
+        feats = []
+        for f in j.get("features", []):
+            g, p = f.get("geometry"), f.get("properties") or {}
+            if not g or not g.get("coordinates"):
+                continue
+            feats.append({
+                "type": "Feature",
+                "properties": {"code": p.get("CdEntCru"), "nom": p.get("lbentcru"), "niv": p.get("NivInfViCr")},
+                "geometry": {"type": g["type"], "coordinates": _round(g["coordinates"])},
+            })
+        return {"type": "FeatureCollection", "publie": j.get("DtHrInfoVigiCru"), "features": feats}
+
+    data = cached("vigilance", ttl=600, loader=load, response=response)
+    response.headers["Cache-Control"] = "public, max-age=300"
     return data
