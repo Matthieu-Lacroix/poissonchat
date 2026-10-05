@@ -90,7 +90,7 @@ const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
 const ign = L.tileLayer("https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/png", {
   maxZoom: 19, attribution: "&copy; IGN"
 });
-L.control.layers({"OpenStreetMap": osm, "Plan IGN": ign}).addTo(map);
+const layerCtl = L.control.layers({"OpenStreetMap": osm, "Plan IGN": ign}).addTo(map);
 const markersLayer = L.featureGroup().addTo(map);
 const markers = new Map();
 
@@ -260,6 +260,28 @@ function afficher(pts) {
   chart.update();
 }
 
+// --- Vigilance crues : tronçons colorés (flux Vigicrues, licence Etalab) -----
+const COUL_VIGI = {1: "#2e9e4f", 2: "#f2c200", 3: "#f28c00", 4: "#d62828"};
+const NOM_VIGI = {1: "vert", 2: "jaune", 3: "orange", 4: "rouge"};
+
+async function chargerVigilance() {
+  try {
+    const g = await api("/api/vigilance");
+    const couche = L.geoJSON(g, {
+      style: f => ({color: COUL_VIGI[f.properties.niv] || "#94a3b8",
+                    weight: f.properties.niv > 1 ? 5 : 3, opacity: 0.9}),
+      onEachFeature: (f, l) => l.bindTooltip(
+        `<b>${esc(f.properties.nom)}</b><br>Vigilance : ${NOM_VIGI[f.properties.niv] || "inconnue"}`, {sticky: true})
+    }).addTo(map);
+    markersLayer.bringToFront();   // les stations restent cliquables au-dessus des tronçons
+    layerCtl.addOverlay(couche, "Vigilance crues");
+    const d = g.publie ? new Date(g.publie).toLocaleString("fr-FR") : "?";
+    map.attributionControl.addAttribution(`Vigilance crues : Vigicrues (publiée le ${d})`);
+  } catch (e) {
+    console.warn("Vigilance crues indisponible :", e.message);   // non bloquant
+  }
+}
+
 // --- Événements --------------------------------------------------------------
 $("station-select").onchange = e => e.target.value && choisir(e.target.value);
 
@@ -291,7 +313,7 @@ const niveau = (h, sv = {}) =>
   h >= sv.jaune ? " · seuil jaune atteint" : "";
 fetch("seuils.json").then(r => r.ok ? r.json() : {}).catch(() => ({}))
   .then(j => { seuils = j; })
-  .finally(() => chargerStations($("dept").value));
+  .finally(() => { chargerStations($("dept").value); chargerVigilance(); });
 </script>
 </body>
 </html>
