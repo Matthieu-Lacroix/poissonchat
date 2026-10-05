@@ -57,6 +57,14 @@ def get_observations(code_station: str):
 
         return list(reversed(data))
 
-    except requests.exceptions.RequestException as e:
-        print(f"\n[ERREUR RESEAU] Blocage de la requête : {e}\n")
-        raise HTTPException(status_code=502, detail=f"Erreur Hub'Eau: {str(e)}")
+    except requests.HTTPError as e:
+        body = e.response.text[:300] if e.response is not None else ""
+        print(f"[HUBEAU] {e.response.status_code} {path} {params} body={body!r}")
+        if hit:
+            return hit[1]
+        raise HTTPException(status_code=502, detail=f"Hub'Eau {e.response.status_code}")
+    except (requests.RequestException, ValueError) as e:
+        print(f"[HUBEAU] {path} -> {e!r}")
+        if hit:
+            return hit[1]
+        raise HTTPException(status_code=502, detail="Hub'Eau injoignable")
