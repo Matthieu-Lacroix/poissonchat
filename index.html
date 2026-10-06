@@ -58,6 +58,7 @@ h2{font-size:17px;margin:0}
       <div id="station-sub" class="sub">Cliquez sur la carte ou utilisez la liste.</div>
     </div>
     <div class="kpis" id="kpis"></div>
+    <div id="reperes" class="sub"></div>
     <div class="periods">
       <button data-h="6">6 h</button>
       <button data-h="24" class="on">24 h</button>
@@ -72,7 +73,7 @@ h2{font-size:17px;margin:0}
 // ⚠ Remplacer par l'URL de ton service Render
 const API_BASE_URL = ["localhost", "127.0.0.1"].includes(location.hostname)
   ? "http://localhost:8000"
-  : "https://poissonchat.onrender.com";
+  : "https://TON-SERVICE.onrender.com";
 const REFRESH_MS = 5 * 60 * 1000;
 
 const $ = id => document.getElementById(id);
@@ -184,7 +185,8 @@ async function chargerObservations(silent = false) {
   const id = ++reqId;
   if (!silent) loading("Chargement des mesures…");
   try {
-    const obs = await api(`/api/observations/${current}?size=${hours * 12}`, ctrl.signal);
+    const [obs] = await Promise.all([api(`/api/observations/${current}?size=${hours * 12}`, ctrl.signal), chargerReperes(current)]);
+    await chargerReperes(current);
     if (id !== reqId) return;
     done();
     const pts = obs.filter(o => o.resultat_obs != null)
@@ -204,6 +206,7 @@ async function chargerObservations(silent = false) {
 
 function vider() {
   $("kpis").innerHTML = "";
+  $("reperes").innerHTML = "";
   if (chart) { chart.data.labels = []; chart.data.datasets[0].data = []; chart.update(); }
 }
 
@@ -224,6 +227,18 @@ function afficher(pts) {
     <div class="kpi"><small>Variation sur 1 h</small><b class="${cls}">${delta === null ? "—" : nfs.format(delta) + " m"}</b></div>
     <div class="kpi"><small>Minimum (${hours} h)</small><b>${nf.format(Math.min(...hs))} m</b></div>
     <div class="kpi"><small>Maximum (${hours} h)</small><b>${nf.format(Math.max(...hs))} m</b></div>`;
+  const rps = reperes[current] || [];
+  const rp = rps.filter(c => c.h > last.h).sort((a, b) => a.h - b.h)[0];
+  if (rps.length) {
+    $("kpis").insertAdjacentHTML("beforeend", `<div class="kpi" style="grid-column:1/-1"><small>Repères de crues historiques</small>` +
+      (rp ? `<b>${esc(rp.nom)} · ${nf.format(rp.h)} m</b><small>${nf.format(rp.h - last.h)} m au-dessus du niveau actuel</small>`
+          : `<b>Niveau supérieur à tous les repères connus</b>`) + `</div>`);
+  }
+  const rf = reperes[current] || [];
+  $("reperes").innerHTML = rf.length
+    ? "<b>Crues de référence</b><br>" + rf.map(c => `${esc(c.nom)} : ${nf.format(c.h)} m ` +
+        `(${c.h > last.h ? nf.format(c.h - last.h) + " m au-dessus du niveau actuel" : "niveau dépassé"})`).join("<br>")
+    : "";
   if (age > 90) setMsg("Dernière mesure ancienne : la station n'émet peut-être plus.", "warn");
 
   const labels = pts.map(p => p.t.toLocaleString("fr-FR",
@@ -240,7 +255,7 @@ function afficher(pts) {
       options: {
         responsive: true, maintainAspectRatio: false, animation: false,
         interaction: {mode: "index", intersect: false},
-        plugins: {legend: {display: false}},
+        plugins: {legend: {labels: {filter: i => i.datasetIndex > 0, boxHeight: 2}}},
         scales: {
           y: {title: {display: true, text: "Hauteur (m, réf. zéro d'échelle)"}},
           x: {ticks: {maxTicksLimit: 6, maxRotation: 0}}
@@ -252,12 +267,27 @@ function afficher(pts) {
   chart.data.datasets[0].data = hs;
   chart.data.datasets.length = 1;
   const sv = seuils[current] || {};
+  const lignes = [];
   for (const [nom, col] of [["jaune", "#ca8a04"], ["orange", "#ea580c"], ["rouge", "#dc2626"]]) {
-    if (sv[nom] == null) continue;
-    chart.data.datasets.push({label: "Seuil " + nom, data: hs.map(() => sv[nom]),
-      borderColor: col, borderWidth: 1.5, borderDash: [6, 4], pointRadius: 0, fill: false});
+    if (sv[nom] != null) lignes.push({label: "Seuil " + nom, v: sv[nom], col});
+  }
+  // Crues historiques : tracées seulement si le niveau s'en approche (sinon elles écrasent la courbe)
+  for (const c of reperes[current] || []) {
+    if (c.h <= Math.max(...hs) + 1.5) lignes.push({label: c.nom, v: c.h, col: "#475569"});
+  }
+  for (const l of lignes) {
+    chart.data.datasets.push({label: `${l.label} (${nf.format(l.v)} m)`, data: hs.map(() => l.v),
+      borderColor: l.col, borderWidth: 1.5, borderDash: [6, 4], pointRadius: 0, fill: false});
   }
   chart.update();
+}
+
+// --- Crues historiques de référence (fiche station Vigicrues) -----------------
+const reperes = {};
+async function chargerReperes(code) {
+  if (code in reperes) return;
+  try { reperes[code] = (await api(`/api/station/${code}`)).crues; }
+  catch { reperes[code] = []; }   // non bloquant : station hors réseau ou service indisponible
 }
 
 // --- Vigilance crues : tronçons colorés (flux Vigicrues, licence Etalab) -----
@@ -280,6 +310,13 @@ async function chargerVigilance() {
   } catch (e) {
     console.warn("Vigilance crues indisponible :", e.message);   // non bloquant
   }
+}
+
+// --- Crues de référence (fiche station Vigicrues) ------------------------------
+const reperes = {};
+async function chargerReperes(code) {
+  if (reperes[code]) return;
+  try { reperes[code] = await api("/api/reperes/" + code); } catch { reperes[code] = []; }
 }
 
 // --- Événements --------------------------------------------------------------
