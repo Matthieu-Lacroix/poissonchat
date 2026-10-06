@@ -205,3 +205,53 @@ def get_vigilance(response: Response):
     data = cached("vigilance", ttl=600, loader=load, response=response)
     response.headers["Cache-Control"] = "public, max-age=300"
     return data
+
+
+# --- Fiche station Vigicrues : crues historiques de référence ----------------
+@app.get("/api/station/{code_station}")
+def get_station_info(response: Response, code_station: str = Path(pattern=r"^[A-Za-z0-9]{8,10}$")):
+    """Crues historiques (hauteurs en m) si la station est dans le réseau Vigicrues, sinon liste vide."""
+
+    def load():
+        try:
+            r = session.get("https://www.vigicrues.gouv.fr/services/station.json",
+                            params={"CdStationHydro": code_station}, timeout=20)
+        except requests.RequestException as e:
+            print(f"[VIGICRUES] station {code_station}: {e!r}")
+            raise HTTPException(status_code=502, detail="Vigicrues injoignable")
+        if 400 <= r.status_code < 500:
+            return {"crues": []}          # station hors réseau Vigicrues
+        if not r.ok:
+            raise HTTPException(status_code=502, detail=f"Vigicrues a répondu {r.status_code}")
+        try:
+            j = r.json()
+        except ValueError:
+            return {"crues": []}
+        brut = (j.get("VigilanceCrues") or {}).get("CruesHistoriques") or []
+        return {"crues": [{"nom": c.get("LbUsuel"), "h": c["ValHauteur"]}
+                          for c in brut if c.get("ValHauteur")]}
+
+    data = cached(f"station:{code_station}", ttl=24 * 3600, loader=load, response=response)
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return data
+
+
+# --- Crues historiques de référence (fiche station Vigicrues) ----------------
+@app.get("/api/reperes/{code_station}")
+def get_reperes(response: Response, code_station: str = Path(pattern=r"^[A-Za-z0-9]{8,10}$")):
+    """Crues historiques (hauteurs en m) d'une station Vigicrues ; [] si la station n'y figure pas."""
+
+    def load():
+        try:
+            r = session.get("https://www.vigicrues.gouv.fr/services/station.json",
+                            params={"CdStationHydro": code_station}, timeout=20)
+            r.raise_for_status()
+            crues = (r.json().get("VigilanceCrues") or {}).get("CruesHistoriques") or []
+        except (requests.RequestException, ValueError):
+            return []   # station absente de Vigicrues ou flux indisponible : pas de repères
+        return sorted(({"nom": c["LbUsuel"], "h": c["ValHauteur"]} for c in crues if c.get("ValHauteur")),
+                      key=lambda c: -c["h"])
+
+    data = cached(f"reperes:{code_station}", ttl=6 * 3600, loader=load, response=response)
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return data
