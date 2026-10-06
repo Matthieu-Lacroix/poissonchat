@@ -58,7 +58,6 @@ h2{font-size:17px;margin:0}
       <div id="station-sub" class="sub">Cliquez sur la carte ou utilisez la liste.</div>
     </div>
     <div class="kpis" id="kpis"></div>
-    <div id="reperes" class="sub"></div>
     <div class="periods">
       <button data-h="6">6 h</button>
       <button data-h="24" class="on">24 h</button>
@@ -186,7 +185,6 @@ async function chargerObservations(silent = false) {
   if (!silent) loading("Chargement des mesures…");
   try {
     const [obs] = await Promise.all([api(`/api/observations/${current}?size=${hours * 12}`, ctrl.signal), chargerReperes(current)]);
-    await chargerReperes(current);
     if (id !== reqId) return;
     done();
     const pts = obs.filter(o => o.resultat_obs != null)
@@ -206,7 +204,6 @@ async function chargerObservations(silent = false) {
 
 function vider() {
   $("kpis").innerHTML = "";
-  $("reperes").innerHTML = "";
   if (chart) { chart.data.labels = []; chart.data.datasets[0].data = []; chart.update(); }
 }
 
@@ -234,11 +231,6 @@ function afficher(pts) {
       (rp ? `<b>${esc(rp.nom)} · ${nf.format(rp.h)} m</b><small>${nf.format(rp.h - last.h)} m au-dessus du niveau actuel</small>`
           : `<b>Niveau supérieur à tous les repères connus</b>`) + `</div>`);
   }
-  const rf = reperes[current] || [];
-  $("reperes").innerHTML = rf.length
-    ? "<b>Crues de référence</b><br>" + rf.map(c => `${esc(c.nom)} : ${nf.format(c.h)} m ` +
-        `(${c.h > last.h ? nf.format(c.h - last.h) + " m au-dessus du niveau actuel" : "niveau dépassé"})`).join("<br>")
-    : "";
   if (age > 90) setMsg("Dernière mesure ancienne : la station n'émet peut-être plus.", "warn");
 
   const labels = pts.map(p => p.t.toLocaleString("fr-FR",
@@ -310,13 +302,6 @@ async function chargerVigilance() {
   } catch (e) {
     console.warn("Vigilance crues indisponible :", e.message);   // non bloquant
   }
-}
-
-// --- Crues de référence (fiche station Vigicrues) ------------------------------
-const reperes = {};
-async function chargerReperes(code) {
-  if (reperes[code]) return;
-  try { reperes[code] = await api("/api/reperes/" + code); } catch { reperes[code] = []; }
 }
 
 // --- Événements --------------------------------------------------------------
