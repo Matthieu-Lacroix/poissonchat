@@ -20,7 +20,7 @@ header{background:var(--surface);padding:12px 24px;box-shadow:0 1px 3px rgba(0,0
 .container{display:flex;flex:1;min-height:0}
 #map{flex:1;z-index:1}
 .panel{width:440px;background:var(--surface);padding:18px;box-shadow:-2px 0 5px rgba(0,0,0,.05);display:flex;flex-direction:column;gap:12px;overflow-y:auto;z-index:2}
-select{padding:10px;width:100%;border-radius:6px;border:1px solid #cbd5e1;font-size:15px}
+select,#station-search{padding:10px;width:100%;border-radius:6px;border:1px solid #cbd5e1;font-size:15px}
 h2{font-size:17px;margin:0}
 .sub{color:var(--muted);font-size:13px;margin-top:2px}
 .kpis{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
@@ -34,6 +34,7 @@ h2{font-size:17px;margin:0}
 .msg{padding:10px;border-radius:6px;background:#f1f5f9;font-size:14px}
 .msg.err{background:#fef2f2;color:#991b1b}.msg.warn{background:#fffbeb;color:#b45309}
 .note{font-size:12px;color:var(--muted);margin:auto 0 0}
+.radar-ctl{background:#fff;padding:6px 10px;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,.3);font-size:13px}.radar-ctl button{cursor:pointer}
 @media(max-width:800px){.container{flex-direction:column}#map{flex:none;height:42%}.panel{width:100%;flex:1}.badge{display:none}}
 </style>
 </head>
@@ -41,8 +42,9 @@ h2{font-size:17px;margin:0}
 
 <header>
   <div class="logo">SUiv'<span>Eau</span></div>
-  <label class="dept">Département
-    <input id="dept" value="69" maxlength="3" aria-label="Code département">
+  <label class="dept">Hausse ≥
+    <input id="seuil" type="number" value="10" min="1" max="500" step="1"> cm / 2 h
+    <span id="hausse-info" class="sub"></span>
   </label>
   <span class="badge">Données Hub'Eau</span>
 </header>
@@ -50,8 +52,9 @@ h2{font-size:17px;margin:0}
 <div class="container">
   <div id="map"></div>
   <aside class="panel">
-    <label for="station-select"><strong>Point de mesure</strong></label>
-    <select id="station-select"><option>Chargement…</option></select>
+    <label for="station-search"><strong>Point de mesure</strong></label>
+    <input id="station-search" list="stations-list" placeholder="Rechercher une station…" autocomplete="off">
+    <datalist id="stations-list"></datalist>
     <div id="msg" class="msg" role="status" hidden></div>
     <div>
       <h2 id="station-title">Sélectionnez une station</h2>
@@ -84,7 +87,7 @@ const nfs = new Intl.NumberFormat("fr-FR", {minimumFractionDigits: 2, maximumFra
 const STYLE    = {radius: 7,  fillColor: "#fff",    color: "#0284c7", weight: 2, fillOpacity: 1};
 const STYLE_ON = {radius: 10, fillColor: "#0284c7", color: "#075985", weight: 3, fillOpacity: 1};
 
-const map = L.map("map").setView([45.75, 4.85], 9);
+const map = L.map("map", {preferCanvas: true}).setView([45.75, 4.85], 9);
 const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19, attribution: "&copy; <a href='https://www.openstreetmap.org/copyright'>OpenStreetMap</a>"
 }).addTo(map);
@@ -122,55 +125,61 @@ async function api(path, signal) {
 }
 
 // --- Stations ----------------------------------------------------------------
-async function chargerStations(dept) {
-  const sel = $("station-select");
-  sel.disabled = true;
-  sel.innerHTML = "<option>Chargement…</option>";
-  markersLayer.clearLayers();
-  markers.clear();
+const labelToCode = new Map();
+let hausses = new Map();                       // code station -> variation en cm sur 2 h
+const STYLE_HAUSSE = {radius: 9, fillColor: "#f97316", color: "#9a3412", weight: 2, fillOpacity: 1};
+const seuilCm = () => Math.max(1, +$("seuil").value || 10);
+const enHausse = c => (hausses.get(c) ?? -Infinity) >= seuilCm();
+const styleDe = c => c === current ? STYLE_ON : enHausse(c) ? STYLE_HAUSSE : STYLE;
+
+async function chargerStations() {
+  const inp = $("station-search");
+  inp.disabled = true;
   loading("Chargement des stations…");
   try {
-    stations = await api("/api/stations?dept=" + encodeURIComponent(dept));
-    done();
-    if (!stations.length) {
-      sel.innerHTML = "<option>Aucune station</option>";
-      return setMsg("Aucune station en service pour ce département.", "warn");
-    }
-    setMsg("");
-    stations.sort((a, b) =>
-      (a.libelle_cours_eau || "").localeCompare(b.libelle_cours_eau || "", "fr") ||
-      a.libelle_station.localeCompare(b.libelle_station, "fr"));
-
-    sel.innerHTML = '<option value="">-- Choisir une station --</option>';
+    stations = await api("/api/stations");
+    done(); setMsg("");
+    stations.sort((a, b) => a.libelle_station.localeCompare(b.libelle_station, "fr"));
+    const dl = $("stations-list");
+    dl.innerHTML = ""; labelToCode.clear(); markersLayer.clearLayers(); markers.clear();
     for (const s of stations) {
-      const o = document.createElement("option");
-      o.value = s.code_station;
-      o.textContent = s.libelle_station;   // le libellé contient déjà le cours d'eau
-      sel.appendChild(o);
-
-      const m = L.circleMarker([s.latitude_station, s.longitude_station], STYLE)
-        .bindTooltip(`<b>${esc(s.libelle_station)}</b><br>${esc(s.libelle_commune)}`);
+      const label = `${s.libelle_station} · ${s.code_station}`;
+      labelToCode.set(label, s.code_station);
+      const o = document.createElement("option"); o.value = label; dl.appendChild(o);
+      const m = L.circleMarker([s.latitude_station, s.longitude_station], styleDe(s.code_station))
+        .bindTooltip(() => `<b>${esc(s.libelle_station)}</b><br>${esc(s.libelle_commune)}` +
+          (hausses.has(s.code_station) ? `<br>${nfs.format(hausses.get(s.code_station))} cm / 2 h` : ""));
       m.on("click", () => choisir(s.code_station));
-      markersLayer.addLayer(m);
-      markers.set(s.code_station, m);
+      markersLayer.addLayer(m); markers.set(s.code_station, m);
     }
-    map.fitBounds(markersLayer.getBounds().pad(0.1));
   } catch (e) {
-    done();
-    sel.innerHTML = "<option>Erreur</option>";
-    setMsg("Impossible de charger les stations : " + e.message, "err");
-  } finally {
-    sel.disabled = false;
+    done(); setMsg("Impossible de charger les stations : " + e.message, "err");
+  } finally { inp.disabled = false; }
+}
+
+async function chargerHausses() {
+  try {
+    hausses = new Map((await api("/api/hausses?heures=2")).map(x => [x.code, x.cm]));
+    appliquerHausses();
+  } catch (e) { console.warn("Hausses indisponibles :", e.message); }
+}
+function appliquerHausses() {
+  let n = 0;
+  for (const [c, m] of markers) {
+    m.setStyle(styleDe(c));
+    if (c !== current && enHausse(c)) { m.bringToFront(); n++; }
   }
+  $("hausse-info").textContent = hausses.size ? `${n} en hausse / ${hausses.size} stations mesurées` : "";
 }
 
 function choisir(code) {
   const s = stations.find(x => x.code_station === code);
   if (!s) return;
-  if (current) markers.get(current)?.setStyle(STYLE);
+  const prev = current;
   current = code;
+  if (prev) markers.get(prev)?.setStyle(styleDe(prev));
   markers.get(code)?.setStyle(STYLE_ON).bringToFront();
-  $("station-select").value = code;
+  $("station-search").value = `${s.libelle_station} · ${code}`;
   $("station-title").textContent = s.libelle_station;
   $("station-sub").textContent = [s.libelle_commune, code].filter(Boolean).join(" · ");
   map.panTo([s.latitude_station, s.longitude_station]);
@@ -328,8 +337,54 @@ async function chargerHistorique(code) {
   } catch { if (code === current) $("histo").innerHTML = ""; }   // non bloquant
 }
 
+// --- Radar de pluie (RainViewer : 2 h passées, pas de prévision) ----------------
+let rl, ri = 0, rt, rframes = [], rhost = "";
+const radarCtl = L.control({position: "bottomleft"});
+radarCtl.onAdd = () => {
+  const d = L.DomUtil.create("div", "radar-ctl");
+  d.innerHTML = `<label><input type="checkbox" id="radar-on"> Radar pluie</label>
+    <span id="radar-box" hidden> <button id="radar-play" type="button">▶</button>
+    <input id="radar-slider" type="range" min="0" max="0" value="0"> <span id="radar-time"></span></span>`;
+  L.DomEvent.disableClickPropagation(d);
+  return d;
+};
+radarCtl.addTo(map);
+
+const rUrl = f => `${rhost}${f.path}/256/{z}/{x}/{y}/2/1_1.png`;
+function radarShow(i) {
+  ri = i; $("radar-slider").value = i;
+  rl.setUrl(rUrl(rframes[i]));
+  $("radar-time").textContent = new Date(rframes[i].time * 1000).toLocaleTimeString("fr-FR", {hour: "2-digit", minute: "2-digit"});
+}
+function radarStop() { clearInterval(rt); rt = null; $("radar-play").textContent = "▶"; }
+async function radarToggle(on) {
+  $("radar-box").hidden = !on;
+  if (!on) { radarStop(); if (rl) map.removeLayer(rl); return; }
+  try {
+    const j = await (await fetch("https://api.rainviewer.com/public/weather-maps.json")).json();
+    rhost = j.host; rframes = (j.radar && j.radar.past) || [];
+    if (!rframes.length) throw new Error("aucune image");
+  } catch (e) {
+    setMsg("Radar RainViewer indisponible.", "warn");
+    $("radar-on").checked = false; $("radar-box").hidden = true; return;
+  }
+  $("radar-slider").max = rframes.length - 1;
+  rl = rl || L.tileLayer(rUrl(rframes[rframes.length - 1]), {
+    opacity: 0.65, maxNativeZoom: 7, maxZoom: 19, zIndex: 5,
+    attribution: '<a href="https://www.rainviewer.com" target="_blank" rel="noopener">Weather data by Rain Viewer</a>'});
+  rl.addTo(map);
+  radarShow(rframes.length - 1);
+}
+$("radar-on").onchange = e => radarToggle(e.target.checked);
+$("radar-slider").oninput = e => { radarStop(); radarShow(+e.target.value); };
+$("radar-play").onclick = () => {
+  if (rt) return radarStop();
+  $("radar-play").textContent = "⏸";
+  rt = setInterval(() => radarShow((ri + 1) % rframes.length), 1000);
+};
+
 // --- Événements --------------------------------------------------------------
-$("station-select").onchange = e => e.target.value && choisir(e.target.value);
+$("station-search").onchange = e => { const c = labelToCode.get(e.target.value); if (c) choisir(c); };
 
 document.querySelectorAll(".periods button").forEach(b => b.onclick = () => {
   hours = +b.dataset.h;
@@ -337,18 +392,14 @@ document.querySelectorAll(".periods button").forEach(b => b.onclick = () => {
   chargerObservations();
 });
 
-$("dept").onchange = e => {
-  const v = e.target.value.trim().toUpperCase();
-  if (!/^(\d{2}|2[AB]|\d{3})$/.test(v)) return setMsg("Code département invalide (ex. 69, 2A, 971).", "warn");
-  current = null; reqId++; ctrl?.abort();
-  $("station-title").textContent = "Sélectionnez une station";
-  $("station-sub").textContent = "Cliquez sur la carte ou utilisez la liste.";
-  vider();
-  chargerStations(v);
-};
+$("seuil").onchange = appliquerHausses;
 
 setInterval(() => {
   if (current && document.visibilityState === "visible") { chargerObservations(true); chargerHistorique(current); }
+  if (document.visibilityState === "visible") {
+    chargerHausses();
+    if ($("radar-on").checked && !rt) radarToggle(true);
+  }
 }, REFRESH_MS);
 
 // Seuils optionnels, en mètres, dans le même référentiel que le graphique :
@@ -359,7 +410,7 @@ const niveau = (h, sv = {}) =>
   h >= sv.jaune ? " · seuil jaune atteint" : "";
 fetch("seuils.json").then(r => r.ok ? r.json() : {}).catch(() => ({}))
   .then(j => { seuils = j; })
-  .finally(() => { chargerStations($("dept").value); chargerVigilance(); });
+  .finally(() => { chargerStations().then(chargerHausses); chargerVigilance(); });
 </script>
 </body>
 </html>

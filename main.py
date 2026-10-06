@@ -106,13 +106,12 @@ def health():
 @app.get("/api/stations")
 def get_stations(
     response: Response,
-    dept: str = Query("69", pattern=r"^(\d{2}|2[AB]|\d{3})$", description="Code département"),
+    dept: str | None = Query(None, pattern=r"^(\d{2}|2[AB]|\d{3})$", description="Code département (vide = France entière)"),
 ):
     def load():
-        rows, url, params = [], f"{BASE}/referentiel/stations", {
-            "code_departement": dept,
-            "size": 1000,
-        }
+        rows, url, params = [], f"{BASE}/referentiel/stations", {"size": 5000}
+        if dept:
+            params["code_departement"] = dept
         for _ in range(10):  # garde-fou contre une pagination infinie
             j = hubeau_json(url, params)
             rows += j.get("data", [])
@@ -127,6 +126,7 @@ def get_stations(
                 "libelle_station": s.get("libelle_station") or s["code_station"],
                 "libelle_cours_eau": s.get("libelle_cours_eau"),
                 "libelle_commune": s.get("libelle_commune"),
+                "code_departement": s.get("code_departement"),
                 "latitude_station": s["latitude_station"],
                 "longitude_station": s["longitude_station"],
             }
@@ -137,7 +137,7 @@ def get_stations(
         ]
         return sorted(out, key=lambda s: s["libelle_station"])
 
-    data = cached(f"stations:{dept}", ttl=24 * 3600, loader=load, response=response)
+    data = cached(f"stations:{dept or 'all'}", ttl=24 * 3600, loader=load, response=response)
     response.headers["Cache-Control"] = "public, max-age=3600"
     return data
 
@@ -240,7 +240,7 @@ def get_station_info(response: Response, code_station: str = Path(pattern=r"^[A-
 # Indicatif : compare le débit actuel aux débits journaliers de la même période de l'année
 # (±15 jours, années passées) et aux maxima annuels. Unités : l/s (identiques en temps réel).
 from bisect import bisect_left
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 
 def _elab_series(code: str, grandeur: str) -> list[tuple[str, float]]:
@@ -317,3 +317,46 @@ def get_historique(response: Response, code_station: str = Path(pattern=r"^[A-Za
             "rang": 1 + sum(1 for v in mx.values() if v > q) if q >= mediane else None,
         }
     return out
+
+
+# --- Hausses récentes du niveau d'eau (toutes les stations, hauteurs temps réel) ----
+@app.get("/api/hausses")
+def get_hausses(response: Response, heures: int = Query(2, ge=1, le=6)):
+    """Variation de hauteur (cm) sur les N dernières heures, pour les stations avec mesures récentes.
+    Le seuil d'affichage est appliqué par le front. Brut et non validé : indicatif."""
+
+    def parse(t: str) -> datetime:
+        return datetime.fromisoformat(t.replace("Z", "+00:00"))
+
+    def load():
+        now = datetime.now(timezone.utc)
+        debut = (now - timedelta(minutes=heures * 60 + 20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        series: dict[str, list] = {}
+        url, params = f"{BASE}/observations_tr", {
+            "grandeur_hydro": "H", "date_debut_obs": debut, "size": 20000,
+            "fields": "code_station,date_obs,resultat_obs"}
+        for _ in range(15):
+            j = hubeau_json(url, params)
+            for o in j.get("data", []):
+                if o.get("resultat_obs") is not None:
+                    series.setdefault(o["code_station"], []).append((parse(o["date_obs"]), o["resultat_obs"]))
+            nxt = j.get("next")
+            if not nxt:
+                break
+            url, params = nxt.replace("http://", "https://", 1), None
+        out = []
+        for code, obs in series.items():
+            t1, h1 = max(obs)
+            if now - t1 > timedelta(hours=3):
+                continue                      # station silencieuse
+            cible = t1 - timedelta(hours=heures)
+            tr, hr = min(obs, key=lambda p: abs(p[0] - cible))
+            if abs(tr - cible) > timedelta(minutes=20):
+                continue                      # pas de mesure comparable
+            out.append({"code": code, "cm": round((h1 - hr) / 10, 1), "h": round(h1 / 1000, 3),
+                        "t": t1.isoformat()})
+        return out
+
+    data = cached(f"hausses:{heures}", ttl=300, loader=load, response=response)
+    response.headers["Cache-Control"] = "public, max-age=120"
+    return data
