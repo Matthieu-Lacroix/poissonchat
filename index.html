@@ -58,6 +58,7 @@ h2{font-size:17px;margin:0}
       <div id="station-sub" class="sub">Cliquez sur la carte ou utilisez la liste.</div>
     </div>
     <div class="kpis" id="kpis"></div>
+    <div id="histo"></div>
     <div class="periods">
       <button data-h="6">6 h</button>
       <button data-h="24" class="on">24 h</button>
@@ -72,7 +73,7 @@ h2{font-size:17px;margin:0}
 // ⚠ Remplacer par l'URL de ton service Render
 const API_BASE_URL = ["localhost", "127.0.0.1"].includes(location.hostname)
   ? "http://localhost:8000"
-  : "https://poissonchat.onrender.com";
+  : "https://TON-SERVICE.onrender.com";
 const REFRESH_MS = 5 * 60 * 1000;
 
 const $ = id => document.getElementById(id);
@@ -173,7 +174,9 @@ function choisir(code) {
   $("station-title").textContent = s.libelle_station;
   $("station-sub").textContent = [s.libelle_commune, code].filter(Boolean).join(" · ");
   map.panTo([s.latitude_station, s.longitude_station]);
+  $("histo").innerHTML = "";
   chargerObservations();
+  chargerHistorique(code);
 }
 
 // --- Observations ------------------------------------------------------------
@@ -204,6 +207,7 @@ async function chargerObservations(silent = false) {
 
 function vider() {
   $("kpis").innerHTML = "";
+  $("histo").innerHTML = "";
   if (chart) { chart.data.labels = []; chart.data.datasets[0].data = []; chart.update(); }
 }
 
@@ -304,6 +308,26 @@ async function chargerVigilance() {
   }
 }
 
+// --- Situation historique (Hub'Eau obs_elab, indicatif) -------------------------
+async function chargerHistorique(code) {
+  try {
+    const h = await api("/api/historique/" + code);
+    if (code !== current) return;
+    if (!h.disponible) { $("histo").innerHTML = ""; return; }
+    const s = h.saison, m3 = n => nf.format(n / 1000);   // l/s -> m³/s
+    const phrase = s.sous_minimum
+      ? `inférieur à tous les débits journaliers observés à cette période depuis ${s.debut}`
+      : `supérieur à ${s.percentile} % des débits moyens journaliers de cette période (${s.n_annees} ans depuis ${s.debut})`;
+    let html = `<div class="kpi"><small>Situation historique (indicatif)</small><b>${m3(h.q)} m³/s</b><small>${phrase}</small>`;
+    if (h.crues) {
+      html += `<br><small>Plus fortes crues annuelles depuis ${h.crues.debut} : ` +
+        h.crues.top.map(c => `${c.annee} (${m3(c.q)} m³/s)`).join(", ") +
+        (h.crues.rang ? `. Le débit actuel se classe au rang ${h.crues.rang} sur ${h.crues.n_annees} ans.` : ".") + `</small>`;
+    }
+    $("histo").innerHTML = html + `</div>`;
+  } catch { if (code === current) $("histo").innerHTML = ""; }   // non bloquant
+}
+
 // --- Événements --------------------------------------------------------------
 $("station-select").onchange = e => e.target.value && choisir(e.target.value);
 
@@ -324,7 +348,7 @@ $("dept").onchange = e => {
 };
 
 setInterval(() => {
-  if (current && document.visibilityState === "visible") chargerObservations(true);
+  if (current && document.visibilityState === "visible") { chargerObservations(true); chargerHistorique(current); }
 }, REFRESH_MS);
 
 // Seuils optionnels, en mètres, dans le même référentiel que le graphique :

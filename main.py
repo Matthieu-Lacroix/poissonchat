@@ -234,3 +234,86 @@ def get_station_info(response: Response, code_station: str = Path(pattern=r"^[A-
     data = cached(f"station:{code_station}", ttl=24 * 3600, loader=load, response=response)
     response.headers["Cache-Control"] = "public, max-age=3600"
     return data
+
+
+# --- Situation historique : séries élaborées Hub'Eau (obs_elab) ---------------
+# Indicatif : compare le débit actuel aux débits journaliers de la même période de l'année
+# (±15 jours, années passées) et aux maxima annuels. Unités : l/s (identiques en temps réel).
+from bisect import bisect_left
+from datetime import date, datetime, timezone
+
+
+def _elab_series(code: str, grandeur: str) -> list[tuple[str, float]]:
+    rows, url, params = [], f"{BASE}/obs_elab", {
+        "code_entite": code, "grandeur_hydro_elab": grandeur, "size": 5000}
+    for _ in range(12):  # 12 x 5000 = 60 000 jours, soit ~160 ans
+        j = hubeau_json(url, params)
+        rows += [(d["date_obs_elab"], d["resultat_obs_elab"])
+                 for d in j.get("data", []) if d.get("resultat_obs_elab") is not None]
+        nxt = j.get("next")
+        if not nxt:
+            break
+        url, params = nxt.replace("http://", "https://", 1), None
+    return rows
+
+
+def _ref_historique(code: str, doy: int, year: int) -> dict:
+    saison, annees = [], set()
+    for d, v in _elab_series(code, "QmnJ"):
+        a = int(d[:4])
+        if a >= year:      # on exclut l'année en cours (incomplète, pré-validée)
+            continue
+        ecart = abs(date.fromisoformat(d[:10]).timetuple().tm_yday - doy)
+        if min(ecart, 366 - ecart) <= 15:
+            saison.append(v)
+            annees.add(a)
+    par_an: dict[int, list] = {}
+    for d, v in _elab_series(code, "QIXnJ"):
+        a = int(d[:4])
+        if a < year:
+            n, m = par_an.get(a, (0, 0.0))
+            par_an[a] = (n + 1, max(m, v))
+    return {
+        "saison": sorted(saison),
+        "n_annees": len(annees),
+        "debut": min(annees) if annees else None,
+        "maxima": {a: m for a, (n, m) in par_an.items() if n >= 300},  # années à peu près complètes
+    }
+
+
+def _debit_actuel(code: str):
+    d = hubeau_json(f"{BASE}/observations_tr",
+                    {"code_entite": code, "grandeur_hydro": "Q", "size": 1}).get("data") or []
+    return {"q": d[0]["resultat_obs"], "date": d[0]["date_obs"]} if d and d[0].get("resultat_obs") is not None else None
+
+
+@app.get("/api/historique/{code_station}")
+def get_historique(response: Response, code_station: str = Path(pattern=r"^[A-Za-z0-9]{8,10}$")):
+    now = datetime.now(timezone.utc)
+    doy = now.timetuple().tm_yday
+    ref = cached(f"hist:{code_station}:{doy}", ttl=24 * 3600, response=response,
+                 loader=lambda: _ref_historique(code_station, doy, now.year))   # lourd : 1 fois/jour/station
+    act = cached(f"qnow:{code_station}", ttl=300, response=response,
+                 loader=lambda: _debit_actuel(code_station))
+    s, mx = ref["saison"], ref["maxima"]
+    response.headers["Cache-Control"] = "public, max-age=300"
+    if not act or len(s) < 300:
+        return {"disponible": False}
+    q = act["q"]
+    out = {
+        "disponible": True, "unite": "l/s", "q": q, "date": act["date"],
+        "saison": {
+            "n_annees": ref["n_annees"], "debut": ref["debut"],
+            "percentile": round(100 * bisect_left(s, q) / len(s)),
+            "sous_minimum": q < s[0],
+        },
+    }
+    if len(mx) >= 20:
+        top = sorted(mx.items(), key=lambda kv: -kv[1])[:3]
+        mediane = sorted(mx.values())[len(mx) // 2]
+        out["crues"] = {
+            "n_annees": len(mx), "debut": min(mx), "fin": max(mx),
+            "top": [{"annee": a, "q": v} for a, v in top],
+            "rang": 1 + sum(1 for v in mx.values() if v > q) if q >= mediane else None,
+        }
+    return out
