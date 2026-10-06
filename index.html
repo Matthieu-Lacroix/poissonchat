@@ -291,7 +291,7 @@ async function chargerVigilance() {
     const g = await api("/api/vigilance");
     const couche = L.geoJSON(g, {
       style: f => ({color: COUL_VIGI[f.properties.niv] || "#94a3b8",
-                    weight: f.properties.niv > 1 ? 5 : 3, opacity: 0.9}),
+                    weight: f.properties.niv > 1 ? 8 : 5, opacity: 0.9}),
       onEachFeature: (f, l) => l.bindTooltip(
         `<b>${esc(f.properties.nom)}</b><br>Vigilance : ${NOM_VIGI[f.properties.niv] || "inconnue"}`, {sticky: true})
     }).addTo(map);
